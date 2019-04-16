@@ -2,22 +2,14 @@
 #include <stdio.h>     //for printf
 #include <string.h>     //for memcmp
 #include <wmmintrin.h>  //for intrinsics for AES-NI
+#include "aegis.h"
 #include <time.h>
 
-#define STATE_128_COUNT 8 // 8 * 128 bit = 640 bit
+#define STATE_128  5 
+#define STATE_128L 8 
+#define STATE_256  6 
 
-#define SIZE 1024 * 64 * 64// 64MB
-
-#define UPDSTATE(state, m_a, m_b) \
-    __m128i tmp = _mm_aesenc_si128(state[7], _mm_xor_si128(state[0], m_a)); \
-    state[7] = _mm_aesenc_si128(state[6], state[7]); \
-    state[6] = _mm_aesenc_si128(state[5], state[6]); \
-    state[5] = _mm_aesenc_si128(state[4], state[5]); \
-    state[4] = _mm_aesenc_si128(state[3], _mm_xor_si128(state[4], m_b)); \
-    state[3] = _mm_aesenc_si128(state[2], state[3]); \
-    state[2] = _mm_aesenc_si128(state[1], state[2]); \
-    state[1] = _mm_aesenc_si128(state[0], state[1]); \
-    state[0] = tmp;
+#define SIZE 1024 * 1024 * 10
 
 static const uint8_t CONST[32] = {
     0x00, 0x01, 0x01, 0x02, 0x03, 0x05, 0x08, 0x0d, 0x15, 0x22, 0x37, 0x59, 0x90, 0xe9, 0x79, 0x62, 
@@ -71,7 +63,7 @@ void init_state(__m128i *state, __m128i key, __m128i iv) {
 
     uint8_t i = 10;
     while (i--) {
-        UPDSTATE(state, iv, key);
+        update_state(state, iv, key);
     }
 }
 
@@ -79,7 +71,7 @@ void process_ad(__m128i *state, const uint8_t *ad, size_t len) {
     size_t l = 0;
     size_t full_block_len = (len >> 5) << 5;
     while (l != full_block_len) {
-        UPDSTATE(state, 
+        update_state(state, 
             _mm_loadu_si128((__m128i *) (ad + l)), 
             _mm_loadu_si128((__m128i *) (ad + l + 16))
         );
@@ -90,7 +82,7 @@ void process_ad(__m128i *state, const uint8_t *ad, size_t len) {
         uint8_t last_block[32];
         memcpy(last_block, ad + full_block_len, diff);
         memset(last_block + diff, 0, 32 - diff);
-        UPDSTATE(state, 
+        update_state(state, 
             _mm_loadu_si128((__m128i *) last_block), 
             _mm_loadu_si128((__m128i *) (last_block + 16))
         );
@@ -112,7 +104,7 @@ void encrypt(__m128i *state, const uint8_t *plain, size_t plain_len, uint8_t *ci
             cipher[l + i] = plain[l + i] ^ state_0[i];
             cipher[l + i + 16] = plain[l + i + 16] ^ state_1[i];
         }
-        UPDSTATE(state, 
+        update_state(state, 
             _mm_loadu_si128((__m128i *) (plain + l)), 
             _mm_loadu_si128((__m128i *) (plain + l + 16))
         );
@@ -132,7 +124,7 @@ void encrypt(__m128i *state, const uint8_t *plain, size_t plain_len, uint8_t *ci
             cipher[l + i + 16] = last_block[i + 16] ^ state_1[i];
         }
 
-        UPDSTATE(state, 
+        update_state(state, 
             _mm_loadu_si128((__m128i *) last_block), 
             _mm_loadu_si128((__m128i *) (last_block + 16))
         );
@@ -154,7 +146,7 @@ void decrypt(__m128i *state, const uint8_t *cipher, size_t cipher_len, uint8_t *
             plain[l + i] = cipher[l + i] ^ state_0[i];
             plain[l + i + 16] = cipher[l + i + 16] ^ state_1[i];
         }
-        UPDSTATE(state, 
+        update_state(state, 
             _mm_loadu_si128((__m128i *) (plain + l)), 
             _mm_loadu_si128((__m128i *) (plain + l + 16))
         );
@@ -175,7 +167,7 @@ void decrypt(__m128i *state, const uint8_t *cipher, size_t cipher_len, uint8_t *
         }
         memset(plain + l + diff, 0, 32 - diff);
 
-        UPDSTATE(state, 
+        update_state(state, 
             _mm_loadu_si128((__m128i *) (plain + l)), 
             _mm_loadu_si128((__m128i *) (plain + l + 16))
         );
@@ -195,7 +187,7 @@ void finalize(__m128i *state, uint64_t ad_len, uint64_t plain_len, uint8_t *tag)
     uint8_t i;
     i = 7;
     while (i--) {
-        UPDSTATE(state, msgtmp, msgtmp);
+        update_state(state, msgtmp, msgtmp);
     }
 
     uint8_t j;
@@ -210,9 +202,65 @@ void finalize(__m128i *state, uint64_t ad_len, uint64_t plain_len, uint8_t *tag)
     }
 }
 
-int main(int argc, const char *argv[]) {
+/**
+ * encrypt using AEGIS-128L
+ *
+ * INPUT:
+ * @param key 128bit
+ * @param iv 128bit
+ * @param msg, len = @param msglen * 8
+ * @param msglen
+ * @param ad, len = @param adlen * 8
+ * @param adlen
+ * OUTPUT:
+ * @param tag 128bit
+ * @param cipher, len = @param msglen
+ */
+void aegis_128l_encrypt(
+    const uint8_t *key, const uint8_t *iv,
+    const uint8_t *msg, size_t msglen,
+    const uint8_t *ad, size_t adlen,
+    uint8_t *tag, uint8_t *cipher
+) {
+    __m128i state[STATE_128L];
+    init_state(state, _mm_loadu_si128((__m128i *) key), _mm_loadu_si128((__m128i *) iv));
+    process_ad(state, ad, adlen);
+    encrypt(state, msg, msglen, cipher);
+    finalize(state, adlen, msglen, tag);
+}
 
-    __m128i state[STATE_128_COUNT];
+/**
+ * decrypt using AEGIS-128L
+ *
+ * INPUT:
+ * @param key 128bit
+ * @param iv 128bit
+ * @param cipher, len = @param cipherlen * 8
+ * @param cipherlen
+ * @param ad, len = @param adlen * 8
+ * @param adlen
+ * @param tag 128bit
+ * OUTPUT:
+ * @param msg, len = @param cipherlen
+ * @return 1 if tag is valid, 0 otherwise
+ */
+uint8_t aegis_128l_decrypt(
+    const uint8_t *key, const uint8_t *iv,
+    const uint8_t *cipher, size_t cipherlen,
+    const uint8_t *ad, size_t adlen,
+    const uint8_t *tag, uint8_t *msg
+) {
+    __m128i state[STATE_128L];
+    init_state(state, _mm_loadu_si128((__m128i *) key), _mm_loadu_si128((__m128i *) iv));
+    process_ad(state, ad, adlen);
+    decrypt(state, cipher, cipherlen, msg);
+
+    uint8_t tag_internal[16];
+    finalize(state, adlen, cipherlen, tag_internal);
+    return !memcmp(tag, tag_internal, 16);
+}
+
+int main(int argc, const char *argv[]) {
 
     uint8_t key[16];
     memset(key, 0, 16);
@@ -238,42 +286,23 @@ int main(int argc, const char *argv[]) {
     uint8_t *cipher = (uint8_t *) malloc(plain_len);
     uint8_t tag[16];
 
-    uint8_t *decrypted_plain = (uint8_t *) malloc(plain_len);
-
     clock_t start, end;
     int t = SIZE;
     start = clock();
     while(t--) {
-        init_state(state, _mm_loadu_si128((__m128i *) key), _mm_loadu_si128((__m128i *) iv));
-        process_ad(state, ad, ad_len);
-        encrypt(state, plain, plain_len, cipher);
-        finalize(state, ad_len, plain_len, tag);
-
-        // init_state(state, _mm_loadu_si128((__m128i *) key), _mm_loadu_si128((__m128i *) iv));
-        // process_ad(state, ad, ad_len);
-        // decrypt(state, cipher, plain_len, decrypted_plain);
-        // finalize(state, ad_len, plain_len, tag);
-
-        // printf("decr   = ");
-        // print_data(decrypted_plain, plain_len);
-
-        // printf("tag = ");
-        // print_data(tag, 16);
+        aegis_128l_encrypt(key, iv, plain, plain_len, ad, ad_len, tag, cipher);
     }
     end = clock();
 
-    printf("cipher (6e99) = ");
+    printf("cipher = ");
     print_data(cipher, plain_len);
 
-    printf("tag    (1ab5) = ");
+    printf("tag    = ");
     print_data(tag, 16);
 
     double cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
     double speed = ((double) SIZE * plain_len) / cpu_time_used / 1048576;
     printf("time used = %.3fs\n", cpu_time_used);
     printf("approx. speed = %.3fMBps\n", speed);
-
-    // printf()
-    printf("done!\n");
     return 0;
 }
